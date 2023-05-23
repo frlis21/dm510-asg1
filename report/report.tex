@@ -1,0 +1,240 @@
+\documentclass{report}
+
+\usepackage{hyperref}
+\usepackage[
+	newfloat=true,
+]{minted}
+\usepackage{caption}
+\usepackage{float}
+\usepackage[
+	vmargin=1in,
+	hmargin=1.5in,
+]{geometry}
+
+\hypersetup{
+	colorlinks=true,
+	linkcolor=blue,
+}
+
+\newenvironment{longlisting}{\captionsetup{type=listing}}{}
+
+\title{
+	DM510 Operating systems \\
+	Assignment 1 \\
+	\normalsize Linux system call
+}
+
+\author{
+	Frederik List \\
+	\small frlis21@student.sdu.dk
+}
+
+\begin{document}
+
+\maketitle
+
+\section*{Introduction}
+
+There is no better way to learn how something works than by taking it apart and messing with it yourself. In this report I outline how I designed, implemented, and tested two system calls in the Linux kernel allowing applications to communicate via a message box.
+
+I created two system calls, namely a \texttt{msgbox\_put} and a \texttt{msgbox\_get}, which respectively place and retrieve a single ``message'' (a byte array) from a global message box. The next section details how I came to the design decisions I did.
+
+\section*{Design}
+\label{sec:design}
+
+There are some constraints we must adhere to when implementing a system call in Linux:%
+%
+\begin{itemize}%
+	\item \textbf{Safety} --- A bad system call must not cause the kernel to panic. Hereunder lie further points to consider. The system call must:
+	      \begin{itemize}
+		      \item be \textbf{robust}; the system call must for example handle malformed input well.
+		      \item handle \textbf{concurrency}; a simultaneous invocation of system calls must not break things.
+	      \end{itemize}
+	      When something does go wrong, the system call must also specifiy what went wrong with error code conventions.
+	\item \textbf{Security} --- A malicious sytem call must not allow a compromised process to do bad things.
+	      \begin{itemize}
+		      \item I am not sure what sort of bad things one could possibly do with a malicious system call, but I am sure there is something.
+	      \end{itemize}
+	\item \textbf{Correctness} --- A system call must, of course, do what it is supposed to without adverse effects such as memory leaks.
+	\item \textbf{Probably a lot of other things} --- Adding a system call is not the first thing one should resort to when adding a feature to the kernel.
+\end{itemize}%
+%
+We can guarantee safety by adding sanity checks throught the code and typing our code well. We will handle security and correctness by attempting to keep our code simple and thus easy to test and audit. We discuss concurrency in the \hyperref[sec:impl]{implementation} section.
+
+We must also consider the policy and semantics of our system calls:
+
+\begin{itemize}
+	\item What happens when we try to get from an empty message box?
+	\item What happens when a message doesn't fit in the given buffer?
+	      \begin{itemize}
+		      \item Truncate and put rest of truncated message in message box?
+		      \item Fail and put failed message back in message box?
+	      \end{itemize}
+	\item What should happen when a \mintinline{c}{NULL} pointer is passed as an argument?
+	\item We use \texttt{kmalloc} for the sake of simplicity which should not be used to allocate more memory than the page size of the operating system. Should messages have a size limit?
+	\item Should we put back messages that could not be copied to user memory?
+\end{itemize}
+
+Considering we are only implementing a system call to get wet our feet in the Linux kernel, we will stick to simplicity.
+
+\begin{itemize}
+	\item Error when trying to get from an empty message box.
+	\item Truncate when a message doesn't fit in the given buffer without doing anything extra.
+	\item Ignore \mintinline{c}{NULL}s.
+	\item No message size limits, though I am sure this has unknown implications.
+	\item Failed messages are lost.
+\end{itemize}
+
+In the next section I discuss how I implemented this design.
+
+\section*{Implementation}
+\label{sec:impl}
+
+Looking at online guides for adding a system call to the Linux kernel, it seems to have been a very laborious task for the older kernels. One had to update several files and manually increment a system call counter, among other potentially error-prone things. The guide we were supposed to follow suggests that we do something similar, however, the files it suggests we update seem to be \emph{generated} by the kernel build process (a new feature?). This led me to investigate how other system calls are added in the Linux kernel, ignoring any \texttt{generated} directories.
+
+\sloppy I found that (at least for the \texttt{x86} architecture and the \texttt{um} architecture which is based on \texttt{x86}, it seems to be different for other architectures) one has to add entries to the \texttt{entry/syscalls/syscall\_64.tbl} file in order to generate the syscall numbers in the \texttt{linux/unistd.h} file. Then it seems to be the convention to add the function prototypes to the \texttt{linux/syscalls.h} file, so that is what I did as well. Then I simply wrote the implementations in a new source file and added it to the build process. The full source code for the system calls can be viewed at \autoref{lst:syscall}.
+
+{
+
+\setminted{
+	numbers=left,
+	fontsize=\footnotesize,
+	tabsize=8,
+	obeytabs=true,
+	escapeinside=||,
+}
+
+\begin{listing}[!ht]
+	\caption{\texttt{.../entry/syscalls/syscall\_64.tbl}}
+	\begin{minted}[
+			firstnumber=373,
+			highlightlines={375-376}
+		]{text}
+449	common	futex_waitv		sys_futex_waitv
+450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
+451	common	dm510_msgbox_put	sys_dm510_msgbox_put
+452	common	dm510_msgbox_get	sys_dm510_msgbox_get
+
+\end{minted}
+\end{listing}
+
+\begin{listing}[!ht]
+	\caption{\texttt{.../include/linux/syscalls.h}}
+	\begin{minted}[
+			firstnumber=1055,
+			highlightlines={1059-1060},
+		]{c}
+asmlinkage long sys_memfd_secret(unsigned int flags);
+asmlinkage long sys_set_mempolicy_home_node(unsigned long start, unsigned long len,
+					    unsigned long home_node,
+					    unsigned long flags);
+asmlinkage long dm510_msgbox_put(char __user *buf, size_t len);
+asmlinkage long dm510_msgbox_get(char __user *buf, size_t len);
+
+\end{minted}
+\end{listing}
+}
+
+After that, the necessary files to invoke the two system calls are generated when you rebuild Linux.
+
+There is nothing particularly fancy going on in the source code. A message is given the type \texttt{msg\_t}. Messages are stored in a stack-like structure, so they keep track of their predecessor in their \texttt{previous} attribute. The current top of the stack is stored in a \mintinline{c}{static struct msg_t *top} initialized to \mintinline{c}{NULL}. Messages can be \texttt{push}ed or \texttt{pop}ped from the stack. Inside the \mintinline{c}{push()} and \mintinline{c}{pop()} procedures is a locking mechanism for preventing concurrency bugs, namely by saving the processor state and disabling interrupts with \mintinline{c}{local_irq_save()} and restoring the processor state and reenabling interrupts with \mintinline{c}{local_irq_restore()}. This is not very good because interrupts are disabled only for the processor the invoking program is running on and race conditions can still occur while calling \mintinline{c}{local_irq_*}, but it will do for now.
+
+The sanity checks mentioned in the \hyperref[sec:design]{design} section can be seen doing their job in the actual implementations of the system calls. There are sanity checks for passed arguments, memory allocation, and copying memory from kernel-space to user-space. If a check fails, it returns a corresponding error number.
+
+So much for the implementation of the system calls.
+
+\section*{Evaluation}
+
+The system calls must be tested for correctness. I wrote 3 user-space programs to assist me in this:
+
+\begin{itemize}
+	\item \texttt{msgbox\_put} --- Puts the first string from the command-line arguments in the message box (see \autoref{lst:put}).
+	\item \texttt{msgbox\_get} --- Takes a number $n$ from the command-line arguments and gets (at most $n$ bytes of) a message from the message box (see \autoref{lst:get}).
+	\item \texttt{test} --- Performs various abuses of the new system calls to see how the kernel reacts (see \autoref{lst:test}).
+\end{itemize}
+
+\noindent There is an accompanying video demonstrating the tests I performed on the system calls using these programs. Note that in the video I am using a wrapper script to start user-mode Linux; this just sets up networking and other goodies for me. I also use a different root filesystem than the one provided, namely a Void Linux root filesystem. This is because I was interested in setting up user-mode Linux myself.
+
+The tests I performed in the video to conclude that the system calls are correct were as follows (with video times in parentheses):
+
+\begin{itemize}
+	\item Attempting to get a message from an empty message box correctly results in an error (00:10).
+	\item Putting and getting random messages (00:14 -- 00:45).
+	\item Getting a message with a buffer that is too small truncates the message and removes it from the message box (00:45).
+	\item Invoking any of the system calls with bad arguments correctly results in an error (01:00). ``Bad arguments'' include
+	      \begin{itemize}
+		      \item \mintinline{c}{NULL}s,
+		      \item negative numbers,
+		      \item bad addresses.
+	      \end{itemize}
+\end{itemize}
+
+\noindent I believe these tests are sufficient to prove that the system calls are correct.
+
+\section*{Message box dynamics}
+
+There are multiple scenarios in which multiple processes would want to use the message box at the same time, many of which have problems because of the global nature of our message box:
+
+\begin{itemize}
+	\item \textbf{Single producer and single consumer}
+	      \begin{itemize}
+		      \item Process $A$ produces messages.
+		      \item Process $B$ consumes messages, polling for new messages.
+		      \item No other processes are using the message box.
+	      \end{itemize}
+	      In this case, the message box functions well. No processes are vying for control over the message box. This is the ideal case.
+	\item \textbf{Bidirectional communication}
+	      \begin{itemize}
+		      \item Processes $A$ and $B$ communicate both ways through the message box.
+	      \end{itemize}
+	      In this case, the message box does not perform very well. Processes waiting for a reply would occasionally take back their own messages, so they would need to implement random backoff or some other strategy to allow their recipient to read the message. This is extremely inefficient. The processes would be better off having two message boxes, one for each direction of communication that no other processes can access.
+	\item \textbf{Pure chaos}
+	      \begin{itemize}
+		      \item Processes $A$ and $B$ want to communicate with each other.
+		      \item Processes $C$, $D$, and $E$ want to communicate with each other.
+		      \item etc.
+	      \end{itemize}
+	      Here our message box completely breaks down. Processes will spend most of their time accidentally stealing other processes' messages or taking back their own messages because no processes can get the messages intended for them.
+\end{itemize}
+
+
+\section*{Conclusion}
+
+Our system call may be useless and crappy, but at it served its purpose well as a gateway to Linux kernel development. That is all!
+
+\appendix
+
+\chapter{Source code}
+
+\setminted{
+	numbers=left,
+	fontsize=\footnotesize,
+	tabsize=8,
+	obeytabs=true,
+}
+
+\begin{longlisting}
+	\caption{\texttt{.../kernel/dm510\_msgbox.c}}
+	\label{lst:syscall}
+	\inputminted{c}{../../uml/linux-6.1.9/arch/um/kernel/dm510_msgbox.c}
+\end{longlisting}
+
+\begin{longlisting}
+	\caption{\texttt{msgbox\_put.c}}
+	\label{lst:put}
+	\inputminted{c}{../src/msgbox_put.c}
+\end{longlisting}
+
+\begin{longlisting}
+	\caption{\texttt{msgbox\_get.c}}
+	\label{lst:get}
+	\inputminted{c}{../src/msgbox_get.c}
+\end{longlisting}
+
+\begin{longlisting}
+	\caption{\texttt{test.c}}
+	\label{lst:test}
+	\inputminted{c}{../src/test.c}
+\end{longlisting}
+
+\end{document}
